@@ -23,6 +23,9 @@
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 static void itrunc(struct inode*);
+static void my_itrunc(struct inode*);
+static int check_itrunc(struct inode*);
+static void recovery(struct inode*);
 // there should be one superblock per disk device, but we run with
 // only one device
 struct superblock sb;
@@ -94,6 +97,41 @@ bfree(int dev, uint b)
 	brelse(bp);
 }
 
+
+static int
+my_bfree(int dev, uint b)
+{
+	struct buf *bp;
+	int bi, m;
+
+	bp = bread(dev, BBLOCK(b, sb));
+	bi = b % BPB;
+	m = 1 << (bi % 8);
+	if((bp->data[bi/8] & m) != 0){
+		brelse(bp);
+		return -1;
+	}
+		// panic("freeing free block");
+	// bp->data[bi/8] &= ~m;
+	// log_write(bp);
+	brelse(bp);
+	return 0;
+}
+
+static void
+set_bit(int dev, uint b)
+{
+	struct buf *bp;
+	int bi, m;
+
+	bp = bread(dev, BBLOCK(b, sb));
+	bi = b % BPB;
+	m = 1 << (bi % 8);
+	if((bp->data[bi/8] & m) == 0)
+		bp->data[bi/8] |= m;
+	log_write(bp);
+	brelse(bp);
+}
 // Inodes.
 //
 // An inode describes a single unnamed file.
@@ -310,6 +348,33 @@ ilock(struct inode *ip)
 	}
 }
 
+void
+my_ilock(struct inode *ip)
+{
+	struct buf *bp;
+	struct dinode *dip;
+
+	if(ip == 0 || ip->ref < 1)
+		panic("ilock");
+
+	acquiresleep(&ip->lock);
+
+	if(ip->valid == 0){
+		bp = bread(ip->dev, IBLOCK(ip->inum, sb));
+		dip = (struct dinode*)bp->data + ip->inum%IPB;
+		ip->type = dip->type;
+		ip->major = dip->major;
+		ip->minor = dip->minor;
+		ip->nlink = dip->nlink;
+		ip->size = dip->size;
+		memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
+		brelse(bp);
+		ip->valid = 1;
+		// if(ip->type == 0)
+		// 	panic("ilock: no type");
+	}
+}
+
 // Unlock the given inode.
 void
 iunlock(struct inode *ip)
@@ -348,6 +413,55 @@ iput(struct inode *ip)
 	acquire(&icache.lock);
 	ip->ref--;
 	release(&icache.lock);
+}
+
+void
+my_iput(struct inode *ip)
+{
+	acquiresleep(&ip->lock);
+	if(ip->valid && ip->nlink == 0){
+		acquire(&icache.lock);
+		int r = ip->ref;
+		release(&icache.lock);
+		if(r == 1){
+			// inode has no links and no other references: truncate and free.
+			my_itrunc(ip);
+			ip->type = 0;
+			iupdate(ip);
+			ip->valid = 0;
+		}
+	}
+	releasesleep(&ip->lock);
+
+	acquire(&icache.lock);
+	ip->ref--;
+	release(&icache.lock);
+}
+
+int
+check_iput(struct inode *ip)
+{	
+	// cprintf("pocetak iput\n");
+	int ans = 0;
+		// inode has no links and no other references: truncate and free.
+		// cprintf("pre check_itrunc\n");
+		ans = check_itrunc(ip);
+		// cprintf("posle check_itrunc\n");
+		// ip->type = 0;
+		iupdate(ip);
+		ip->valid = 0;
+		// ip->ref--;
+	return ans;
+}
+
+void setting_bitmap(struct inode *ip)
+{
+	if(ip->valid && ip->nlink == 0){
+		// inode has no links and no other references: truncate and free.
+		recovery(ip);
+		iupdate(ip);
+		ip->valid = 0;
+	}
 }
 
 // Common idiom: unlock, then put.
@@ -430,6 +544,102 @@ itrunc(struct inode *ip)
 
 	ip->size = 0;
 	iupdate(ip);
+}
+
+static void
+my_itrunc(struct inode *ip)
+{
+	int i, j;
+	struct buf *bp;
+	uint *a;
+
+	for(i = 0; i < NDIRECT; i++){
+		if(ip->addrs[i]){
+			bfree(ip->dev, ip->addrs[i]);
+			// ip->addrs[i] = 0;
+		}
+	}
+
+	if(ip->addrs[NDIRECT]){
+		bp = bread(ip->dev, ip->addrs[NDIRECT]);
+		a = (uint*)bp->data;
+		for(j = 0; j < NINDIRECT; j++){
+			if(a[j])
+				bfree(ip->dev, a[j]);
+		}
+		brelse(bp);
+		bfree(ip->dev, ip->addrs[NDIRECT]);
+		// ip->addrs[NDIRECT] = 0;
+	}
+
+	// ip->size = 0;
+	iupdate(ip);
+}
+
+static void
+recovery(struct inode *ip)
+{
+	int i, j;
+	struct buf *bp;
+	uint *a;
+
+	for(i = 0; i < NDIRECT; i++){
+		if(ip->addrs[i]){
+			set_bit(ip->dev, ip->addrs[i]);
+			// ip->addrs[i] = 0;
+		}
+	}
+
+	if(ip->addrs[NDIRECT]){
+		bp = bread(ip->dev, ip->addrs[NDIRECT]);
+		a = (uint*)bp->data;
+		for(j = 0; j < NINDIRECT; j++){
+			if(a[j])
+				set_bit(ip->dev, a[j]);
+		}
+		brelse(bp);
+		set_bit(ip->dev, ip->addrs[NDIRECT]);
+		// ip->addrs[NDIRECT] = 0;
+	}
+
+	// ip->size = 0;
+	iupdate(ip);
+}
+
+static int
+check_itrunc(struct inode *ip)
+{	int ans = 0;
+	int i, j;
+	struct buf *bp;
+	uint *a;
+
+	for(i = 0; i < NDIRECT; i++){
+		if(ip->addrs[i]){
+			if(my_bfree(ip->dev, ip->addrs[i])){
+				ans = -1;
+			}
+			// ip->addrs[i] = 0;
+		}
+	}
+
+	if(ip->addrs[NDIRECT]){
+		bp = bread(ip->dev, ip->addrs[NDIRECT]);
+		a = (uint*)bp->data;
+		for(j = 0; j < NINDIRECT; j++){
+			if(a[j]){
+				if(my_bfree(ip->dev, a[j]))
+					ans = -1;
+			}
+		}
+		
+		brelse(bp);
+		// bfree(ip->dev, ip->addrs[NDIRECT]);
+		// ip->addrs[NDIRECT] = 0;
+	}
+
+	// ip->size = 0;
+	// iupdate(ip);
+	return ans;
 }
 
 // Copy stat information from inode.
@@ -530,11 +740,39 @@ dirlookup(struct inode *dp, char *name, uint *poff)
 			panic("dirlookup read");
 		if(de.inum == 0)
 			continue;
-		if(namecmp(name, de.name) == 0){
+		if(namecmp(name, de.name) == 0 && de.del == 0){
 			// entry matches path element
 			if(poff)
 				*poff = off;
 			inum = de.inum;
+			// cprintf("%d\n", inum);
+			return iget(dp->dev, inum);
+		}
+	}
+
+	return 0;
+}
+
+struct inode*
+my_dirlookup(struct inode *dp, char *name, uint *poff)
+{
+	uint off, inum;
+	struct dirent de;
+
+	if(dp->type != T_DIR)
+		panic("dirlookup not DIR");
+
+	for(off = 0; off < dp->size; off += sizeof(de)){
+		if(readi(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
+			panic("dirlookup read");
+		if(de.inum == 0)
+			continue;
+		if(namecmp(name, de.name) == 0 && de.del == 1){
+			// entry matches path element
+			if(poff)
+				*poff = off;
+			inum = de.inum;
+			// cprintf("%d\n", inum);
 			return iget(dp->dev, inum);
 		}
 	}
@@ -560,12 +798,23 @@ dirlink(struct inode *dp, char *name, uint inum)
 	for(off = 0; off < dp->size; off += sizeof(de)){
 		if(readi(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
 			panic("dirlink read");
-		if(de.inum == 0)
+		// if(de.inum == 0)
+		// 	break;
+
+		// izmena proverava da li je dirent isto i obrisan
+	
+		if(de.del == 1 || de.inum == 0)
 			break;
+
 	}
 
 	strncpy(de.name, name, DIRSIZ);
 	de.inum = inum;
+
+	// izmena <- kada kreiramo postavljamo brisanje na nula za dirent 
+	de.del = 0;
+	// 
+
 	if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
 		panic("dirlink");
 

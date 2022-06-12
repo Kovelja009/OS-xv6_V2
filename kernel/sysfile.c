@@ -197,6 +197,8 @@ sys_unlink(void)
 		return -1;
 	}
 
+	
+
 	ilock(dp);
 
 	// Cannot unlink "." or "..".
@@ -214,19 +216,56 @@ sys_unlink(void)
 		goto bad;
 	}
 
-	memset(&de, 0, sizeof(de));
+	// deo za menjanje
+	// memset(&de, 0, sizeof(de));
+	// if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
+	// 	panic("unlink: writei");
+	// if(ip->type == T_DIR){
+	// 	dp->nlink--;
+	// 	iupdate(dp);
+	// }
+
+	de.del = 1;
+	ip->type = 0;
+	for(int i = 0; i < DIRSIZ; i++)
+		de.name[i] = name[i];
+	de.inum = ip->inum;
+	// de.name[DIRSIZ] = 0;
+	// de.inum =		potencijalni problem? 
+
+	// cprintf("pre writei: %s\n", de.name);
+
 	if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
 		panic("unlink: writei");
 	if(ip->type == T_DIR){
 		dp->nlink--;
 		iupdate(dp);
 	}
+	// cprintf("posle writei: %s\n", de.name);
+
 	iunlockput(dp);
 
-	ip->nlink--;
+	//--------------------
+	
+	ip->nlink--;	// kada nlink pokazuje na 0 onda se oslobadjaju blokovi
 	iupdate(ip);
-	iunlockput(ip);
 
+	//--------------------
+	int type = ip->type;
+	int size = ip->size;
+	//--------------------
+	// iunlockput(ip);
+	//--------------------
+	// my_test
+	iunlock(ip);
+	my_iput(ip);
+
+
+	//--------------------
+	//--------------------
+	// cprintf("type: %d\n", ip->type);
+	// cprintf("size: %d\n", ip->size);
+	//--------------------
 	end_op();
 
 	return 0;
@@ -279,6 +318,215 @@ create(char *path, short type, short major, short minor)
 	iunlockput(dp);
 
 	return ip;
+}
+
+uint
+my_strlen(const char *s)
+{
+	int n;
+
+	for(n = 0; s[n]; n++)
+		;
+	return n;
+}
+
+char*
+my_strcpy(char *s, const char *t)
+{
+	char *os;
+
+	os = s;
+	while((*s++ = *t++) != 0)
+		;
+	return os;
+}
+
+void*
+my_memmove(void *vdst, const void *vsrc, int n)
+{
+	char *dst;
+	const char *src;
+
+	dst = vdst;
+	src = vsrc;
+	while(n-- > 0)
+		*dst++ = *src++;
+	return vdst;
+}
+
+
+int sys_rec(void)
+{
+	char *path;
+	char name[DIRSIZ];
+	struct inode *ip, *dp;
+	struct dirent de;
+	uint off;
+
+	if(argstr(0, &path) < 0)
+		return -1;
+
+	begin_op();
+	if((dp = nameiparent(path, name)) == 0){
+		end_op();
+		return -1;
+	}
+
+	ilock(dp);
+
+	// Cannot unlink "." or "..".
+	if(namecmp(name, ".") == 0 || namecmp(name, "..") == 0){
+		iunlockput(dp);
+		end_op();
+		return -2;
+	}
+
+	if((ip = my_dirlookup(dp, name, &off)) == 0){
+		iunlockput(dp);
+		end_op();
+		return -2;
+	}
+	my_ilock(ip);	// zakomentarisamo panic ip->type = 0
+
+	if(ip->type != 0){
+		iunlockput(dp);
+		iunlockput(ip);
+		end_op();
+		return -3;
+	}
+
+	if(check_iput(ip)){
+		iunlockput(dp);
+		iunlockput(ip);
+		end_op();
+		return -4;
+	}
+
+	setting_bitmap(ip);
+
+	de.del = 0;
+	ip->type = T_FILE;
+	for(int i = 0; i < DIRSIZ; i++)
+		de.name[i] = name[i];
+	de.inum = ip->inum;
+
+	if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
+		panic("sys_rec unlink: writei");
+
+
+	//--------------------
+	iunlockput(dp);
+
+	ip->nlink++;
+	//--------------------
+	// cprintf("type: %d\n", ip->type);
+	// cprintf("size: %d\n", ip->size);
+	//--------------------
+	iupdate(ip);
+	iunlock(ip);
+
+	end_op();
+	return 0;
+
+}
+
+
+int sys_lsdel(void)
+{
+	char *path;
+	char *result;
+	int fd;
+
+	struct file *f;
+	struct inode *ip;
+	struct stat st;
+	struct dirent de;
+
+	if(argstr(0, &path) < 0 || argstr(1, &result) < 0)
+		return -2;
+
+	// file opening
+	begin_op();
+
+	if((ip = namei(path)) == 0){
+			end_op();
+			return -1;
+		}
+		ilock(ip);
+
+	if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+		if(f)
+			fileclose(f);
+		iunlockput(ip);
+		end_op();
+		return -1;
+	}
+	iunlock(ip);
+	end_op();
+
+	f->type = FD_INODE;
+	f->ip = ip;
+	f->off = 0;
+	f->readable = 1;
+	f->writable = 0;
+
+	if(fd < 0)
+		return -1;
+	/////////////////////////////
+	// fstat reconstruction
+	
+	if(f->type == FD_INODE){
+		ilock(f->ip);
+		stati(f->ip, (void *)&st);
+		iunlock(f->ip);
+	}else
+		goto bad;
+		// return -4;
+	
+	if(st.type == T_FILE)
+		goto bad;
+		// return -5;
+
+	if(my_strlen(path) + 1 + DIRSIZ + 1 > 512)
+		goto bad;
+		// return -6;
+	////////////////////////////
+	// iteration
+	int n = sizeof(de);
+	int cnt = 0;
+	////////////////////////////
+	// argptr
+	char* temp;
+	// int itmp;
+	// struct proc *curproc = myproc();
+	// if(n < 0 || (uint)de >= curproc->sz || (uint)de+n > curproc->sz)
+	// 	return -7;
+	temp = (char*)&de;
+	////////////////////////////
+	while(fileread(f, temp, n) == n){
+		if(de.del == 0)
+			continue;
+		if(cnt == 64)
+			goto closing;
+		// cprintf("%s\n", de.name);
+		strncpy(result+cnt*(DIRSIZ+1), de.name, DIRSIZ);
+		(result+cnt*(DIRSIZ+1))[DIRSIZ] = 0;
+		cnt++;
+	}
+
+
+	////////////////////////////
+	// closing
+	closing:
+		myproc()->ofile[fd] = 0;
+		fileclose(f);
+
+		return cnt;
+	bad: 
+		myproc()->ofile[fd] = 0;
+		fileclose(f);
+
+		return -1;
 }
 
 int
