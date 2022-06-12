@@ -1,4 +1,4 @@
-# OS-xv6_V1
+# OS-xv6_V2
 implementation of delete-recovery functionality
 
 This is once again a university project we had to do. To run this project you have to be on a linux OS because the QEMU virtual machine won't run on a Windows machine. Simply go to the directory of the project you cloned from the repo and type "make qemu" into your console. If you notice something went wrong while you were using the QEMU vm simply type "make clean" before running QEMU with "make qemu" again.
